@@ -1,0 +1,526 @@
+<?php
+
+/**
+ * Includes a file for preprocessing variables for templates.
+ */
+include_once 'theme/reg_wizard_preprocess.inc';
+
+/**
+ * Founder registration specific logic.
+ */
+include_once 'wizard/founder/reg_wizard_founder.inc';
+
+/**
+ * Member registration specific logic.
+ */
+include_once 'wizard/supporter/reg_wizard_supporter.inc';
+
+/**
+ * Society Member registration specific logic.
+ */
+include_once 'wizard/society/reg_wizard_society.inc';
+
+include_once 'includes/messages.inc';
+include_once 'includes/validate.inc';
+
+/**
+ * The registration for a founder.
+ */
+define('FOUNDER_REGISTRATION', 'reg_wizard_founder');
+define('SUPPORTER_REGISTRATION', 'reg_wizard_supporter');
+define('SOCIETY_REGISTRATION', 'reg_wizard_society');
+
+/**
+ * @file
+ * Example module for ctools miltistep form wizard.
+ *
+ * Example module which demonstrates the power of ctools multistep wizard.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function reg_wizard_menu() {
+  $items['register'] = array(
+    'title' => '',
+    'page callback' => 'reg_wizard_initiate_registration',
+    'access callback' => 'reg_wizard_access',
+    'type' => MENU_CALLBACK,
+  );
+  $items['unsubscribe'] = array(
+    'title' => '',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('reg_wizard_supporter_unsubscribe'),
+    'access callback' => TRUE,
+    'file' => 'includes/unsubscribe.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['unsubscribe/%'] = array(
+    'title' => '',
+    'page callback' => 'reg_wizard_supporter_unsubscribe_send_email',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'file' => 'includes/unsubscribe.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['register/start'] = array(
+    'title' => '',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('reg_wizard_register_start'),
+    'access callback' => TRUE,
+    'file' => 'reg_wizard_register_start.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['register/founder/tos/%reg_wizard_target'] = array(
+    'title' => '',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('reg_wizard_founder_start',1,3),
+    'access callback' => 'reg_wizard_founder_access',
+    'access arguments' => array(1,3),
+    'file' => 'wizard/founder/reg_wizard_founder_start.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * @param array $items
+ */
+function reg_wizard_menu_alter(&$items) {
+//  if (!empty($items['register/founder/%/%ctools_js'])) {
+//    $items['register/founder/%/%ctools_js']['page callback'] = 'reg_wizard_helper_wizard';
+//  }
+//  if (!empty($items['user/register'])) {
+//    $items['user/register']['access callback'] = FALSE;
+//  }
+}
+
+/**
+ * Implements hook_wizard_info().
+ *
+ * When adding a new wizard you must add it here.
+ */
+function reg_wizard_wizard_info() {
+  $info = array();
+
+  $info['register/founder'] = reg_wizard_founder_info();
+  $info['register/supporter'] = reg_wizard_supporter_info();
+  $info['register/society'] = reg_wizard_society_info();
+
+  return $info;
+}
+
+/**
+ * We use this to populate the $user->data object with the information we get
+ * from Stripe.
+ */
+function reg_wizard_user_presave(&$edit, &$account, $category) {
+  if (isset($edit['wizard']) &&  $edit['wizard'] == 'society') {
+
+    $wizard = wizard_helper_load('register/society');
+    $cid = wizard_helper_cache_name($wizard, empty($_id));
+    ctools_include('object-cache');
+    // Get the ctools cache.
+    $ctools_cache = ctools_object_cache_get($wizard['object name'], $cid);
+
+    $edit['data']['stripe'] = array();
+
+    // Remove null values.
+    array_filter($ctools_cache['stripe']);
+
+    foreach ($ctools_cache['stripe'] as $k => $v) {
+      $edit['data']['stripe'][$k] = $v;
+    }
+  }
+}
+
+
+/**
+ * Implements hook_mail().
+ */
+function reg_wizard_mail($key, &$message, $params) {
+  $language = $message['language'];
+
+  if ($key == 'verify') {
+    $message['subject'] .= variable_get('reg_wizard_verification_subject', t('Verification e-mail'));
+    $message['body'][] = variable_get('reg_wizard_verification_body', t('Please verify your e-mail by entering the following code: [user:verify-wizard-email]'));
+  }
+  if ($key == 'supporter_register') {
+    $message['subject'] = t('CEDI Supporter');
+    $message['body'][] = 'template';
+  }
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function reg_wizard_mail_alter(&$message) {
+  if ($message['module'] == 'reg_wizard' && $message['key'] == 'verify') {
+    $language = $message['language'];
+    if (isset($message['params']['account'])) {
+      $code = isset($message['params']['code']) ? $message['params']['code'] : reg_wizard_user_email_verification_code($message['params']['account']->uid);
+    }
+    else {
+      $code = reg_wizard_user_email_verification_code(0);
+    }
+    // We only care about the body.
+    if (!empty($message['body']) && isset($code)) {
+      foreach ($message['body'] as &$body) {
+        $body = str_replace('[user:verify-wizard-email]', $code, $body);
+      }
+      $message['hmac'] = $code;
+    }
+  }
+}
+
+/**
+ * Generate a verification code.
+ *
+ * @param int $uid
+ *   This is using 0 since we are sending this code to anonymous users.
+ *
+ * @return string
+ *  The verification code.
+ */
+function reg_wizard_user_email_verification_code($uid = 0) {
+  $timestamp = REQUEST_TIME;
+  $hmac = reg_wizard_verification_hmac($uid, $timestamp);
+
+  // Trim the code a bit.
+  $code = substr($hmac, 0, -25);
+
+  if ($uid > 0) {
+    $account = user_load($uid);
+    $account->data['verification'] = $code;
+    user_save($account);
+  }
+
+  // Remove hyphens if they exist. Less chance someone will miss part of the
+  // code if they double click the code in the email to copy it.
+  $code = str_replace('-', '', $code);
+  return $code;
+}
+
+/**
+ * Helper function to generate HMAC.
+ *
+ * @param int $uid
+ * @param int $timestamp
+ *
+ * @return string
+ *  A base-64 encoded, URL-safe sha-256 hmac
+ */
+function reg_wizard_verification_hmac($uid, $timestamp) {
+  $string = drupal_get_hash_salt() . $uid . variable_get('reg_wizard_verification_salt', 'salt');
+  return drupal_hmac_base64($timestamp . $uid, $string);
+}
+
+/**
+ * This is used to define an argument dynamically in a menu path.
+ *
+ * Note the naming convention here.
+ *
+ * e.g., %reg_wizard_target
+ *
+ * @param string $arg
+ *   The argument that exists in the url for this placeholder.
+ *
+ * @return mixed
+ */
+function reg_wizard_target_to_arg($arg) {
+  if ($arg) {
+    return $arg;
+  }
+}
+
+/**
+ * Handles storing fields in the wizard object cache during each step of the
+ * wizard.
+ *
+ * @param array $form
+ * @param array $form_state
+ */
+function reg_wizard_step_submit(&$form, &$form_state) {
+
+  // Get the current state of the cache.
+  $object = wizard_helper_cache_get($form_state['wizard_info']);
+
+  $ignore = array('step_trail', 'regcode', 'step', 'form_build_id', 'form_id', 'js', 'ajax_html_ids', 'ajax_page_state', 'ajax_iframe_upload', 'op');
+
+  // Store all input fields in our registration object.
+  foreach ($form_state['input'] as $field => $value) {
+    if (!in_array($field, $ignore)) {
+      $object[$field] = $value;
+    }
+  }
+
+  // Get the wizard.
+  $wizard = &$form_state['wizard_info'];
+
+  // Populate registration with the new object data.
+  $form_state[$wizard['object name']] = $object;
+  // Save a copy in the session.
+  $_SESSION[$form_state['wizard_info']['object name']] = $object;
+}
+
+/**
+ * Access callback for menus.
+ *
+ * @return bool
+ */
+function reg_wizard_access() {
+  // Set access to false initially.
+  $access = FALSE;
+
+  // User must be anonymous to register.
+  if ($can_register = user_is_anonymous()) {
+    switch($_GET['q']) {
+      case 'register':
+        // This would mean we are registering a founder for a C,C,C.
+        if (isset($_GET['regcode']) && isset($_GET['target'])) {
+          $access = reg_wizard_validate_regcode($_GET['regcode']);
+        }
+        else {
+          $access = TRUE;
+        }
+        break;
+      default:
+        if ($parts = explode('/', $_GET['q'])) {
+          $code = end($parts);
+          if (reg_wizard_validate_regcode($code) || $code == 'ajax') {
+            $access = TRUE;
+          }
+          else {
+            drupal_set_message(t('It appears you do not have access to register. If you clicked on the link in the email please contact us. If you copied and pasted please make sure you copied the entire link.'));
+          }
+        }
+        break;
+    }
+  }
+  // @todo Change back to $access
+  return $access;
+}
+
+/**
+ * Called for every page within the wizard.
+ */
+function reg_wizard_register_page(&$step, &$wizard) {
+  if ($step) {
+
+  }
+}
+
+/**
+ * This triggers registration at path: /register. It requires a couple query
+ * parameters.
+ *
+ * regcode:
+ *   A valid registration code that has been generated by our system.
+ *
+ * target:
+ *   The type of registration we are targeting, such as 'founder'.
+ *
+ * @return array
+ *   A render array for displaying few links.
+ *
+ * @see reg_wizard_menu()
+ */
+function reg_wizard_initiate_registration() {
+
+  if (isset($_GET['target']) & isset($_GET['regcode'])) {
+    drupal_goto('register/' . $_GET['target'] . '/' . $_GET['regcode']);
+  }
+  else {
+    drupal_goto('register/start');
+  }
+
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * @return array
+ */
+function reg_wizard_theme() {
+  return array(
+    'reg_wizard_register_start' => array(
+      'variables' => array(
+        'supporter_join' => NULL,
+        'society_join' => NULL,
+      ),
+      'path' => drupal_get_path('module', 'reg_wizard'),
+      'template' => 'reg_wizard_register_start',
+    ),
+    'reg_wizard_founder_start' => array(
+      'render element' => 'form',
+      'path' => drupal_get_path('module', 'reg_wizard') . '/wizard/founder',
+      'template' => 'reg_wizard_founder_start',
+    ),
+    'reg_wizard_address_format' => array(
+      'variables' => array(
+        'address_format' => NULL,
+      ),
+      'path' => drupal_get_path('module', 'reg_wizard') . '/theme',
+      'template' => 'reg_wizard_address_format',
+    ),
+  );
+}
+
+function reg_wizard_views_pre_render(&$view) {
+  if ($view->name == 'commerce_cart_form') {
+    $view->use_ajax = TRUE;
+  }
+}
+
+function reg_wizard_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'reg_wizard_society_cart') { //views_form_commerce_cart_form_default
+
+  }
+}
+
+function reg_wizard_after_build(&$form, &$form_state) {
+  if (isset($form_state['input']['op']) && $form_state['input']['op'] == 'Update cart') {
+    $form['#submit'] = array();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * We are just removing the registration code field from the user registration
+ * form since we are validating the registration code through the url when a
+ * link is sent to a future member.
+ *
+ * @param $form
+ * @param $form_state
+ */
+function reg_wizard_form_user_register_form_alter(&$form, &$form_state) {
+  $form['regcode']['regcode_code']['#access'] = FALSE;
+  // Set each of these to false independently so we can show them only on the
+  // steps we want to.
+  $form['account']['name']['#access'] = FALSE;
+  $form['account']['mail']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Using this to set the options for the checkboxes for skills on profile_cont.
+ */
+function reg_wizard_form_field_ui_field_edit_form_alter(&$form, &$form_state, $form_id) {
+  $instance = $form['#instance'];
+
+  // Set callback for 'Allowed Values" list for user skills.
+  if ($instance['entity_type'] == 'user' && $instance['field_name'] == 'field_user_skills_strengths' && !$form['#field']['locked']) {
+
+    $form['field']['settings']['allowed_values_function']['#value'] = 'reg_wizard_user_skill_options';
+
+    array_unshift($form['#submit'], 'reg_wizard_form_field_ui_field_edit_form_submit');
+  }
+}
+
+function reg_wizard_form_field_ui_field_edit_form_submit($form, &$form_state) {
+  $form_state['values']['field']['settings']['allowed_values_function'] = 'reg_wizard_user_skill_options';
+}
+
+/**
+ * Defines a list of options for user skills.
+ *
+ * @return array
+ */
+function reg_wizard_user_skill_options() {
+  return array(
+    'accounting_auditing' => t('Accounting/Auditing'),
+    'marketing' => t('Marketing'),
+    'research' => t('Research'),
+    'finance' => t('Finance'),
+    'design' => t('Design'),
+    'writing_editing' => t('Writing/Editing'),
+    'analyst' => t('Analyst'),
+    'art_creative' => t('Art/Creative'),
+    'business_development' => t('Business Development'),
+    'engineering' => t('Engineering'),
+    'general_business' => t('General Business'),
+    'human_resources' => t('Human Resources'),
+    'legal' => t('Legal'),
+    'it' => t('IT'),
+    'public_relations' => t('Public Relations'),
+    'sales' => t('Sales'),
+    'strategy_planning' => t('Strategy Planning'),
+    'training' => t('Training'),
+    'healthcare' => t('Healthcare'),
+    'economic_development' => t('Economic Development'),
+    'nonprofits_ngo' => t('Non-profits/NGOs'),
+    'social_media' => t('Social Media'),
+    'journalism' => t('Journalism'),
+    'management' => t('Management'),
+    'education' => t('Education'),
+  );
+}
+
+/**
+ * Helper function to define what fields will show from the user_register_form
+ * during certain steps of the registration wizard.
+ */
+function reg_wizard_set_fields(&$form, $fieldnames) {
+  $fields = array();
+  foreach (field_info_instances('user', 'user') as $name => $instance) {
+    if (!in_array($name, $fieldnames)) {
+      if (isset($form['account'][$name])) {
+        $fields[$name] = $form['account'][$name];
+      }
+      else if (isset($form[$name]) && !is_array($form[$name])) {
+        $fields[$name] = $form[$name];
+      }
+      else {
+        $form[$name]['#access'] = FALSE;
+      }
+    }
+    else {
+      $fields[$name] = $instance;
+    }
+  }
+  // Don't show the 'Create account' button.
+  $form['actions']['submit']['#access'] = FALSE;
+
+  // This isn't necessary but might come in handy.
+  return $fields;
+}
+
+function reg_wizard_step_access($wizard) {
+  $path = $_GET['q'];
+
+  $step = isset($wizard['object']['step']) ? $wizard['object']['step'] : NULL;
+  $step_trail = isset($wizard['object']['step_trail']) ? $wizard['object']['step_trail'] : NULL;
+
+  if (isset($step_trail, $step)) {
+
+    $prev = wizard_helper_trail_previous($step, $wizard['object']);
+
+    if (strpos($path, $step) != FALSE) {
+      if (in_array($step, $step_trail)) {
+        return TRUE;
+      }
+      else {
+        wizard_helper_goto($wizard, $step);
+        return FALSE;
+      }
+    }
+    else {
+      wizard_helper_goto($wizard, $prev);
+      return FALSE;
+    }
+  }
+  // They haven't started the wizard.
+  else {
+    wizard_helper_goto($wizard, $wizard['start']);
+    return FALSE;
+  }
+}
+
+function reg_wizard_default($field, $object) {
+  return isset($object[$field]) ? $object[$field] : '';
+}

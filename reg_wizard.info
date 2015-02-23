@@ -1,0 +1,6 @@
+name = Registration Wizard
+description = A registration wizard that walks users through through creating an account
+core = 7.x
+package = Cedi
+
+dependencies[] = wizard_helper
